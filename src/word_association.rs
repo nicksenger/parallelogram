@@ -3,15 +3,19 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 
+use super::{
+    AlignableSentenceTable, Coordinates, Score, SentenceAlignmentTable, WordSentenceIndex, X, Y,
+};
+
 pub struct WordAssociation<'a, Word> {
     pub a: &'a Word,
     pub b: &'a Word,
     pub similarity: f32,
     pub a_occurrences: usize,
     pub b_occurrences: usize,
-    alignable_sentence_table: &'a Vec<Vec<usize>>,
-    a_word_sentence_index: &'a HashMap<&'a Word, Vec<usize>>,
-    b_word_sentence_index: &'a HashMap<&'a Word, Vec<usize>>,
+    ast: &'a AlignableSentenceTable,
+    a_word_sentence_index: &'a WordSentenceIndex<'a, Word, Y>,
+    b_word_sentence_index: &'a WordSentenceIndex<'a, Word, X>,
 }
 
 impl<'a, Word> Clone for WordAssociation<'a, Word> {
@@ -22,7 +26,7 @@ impl<'a, Word> Clone for WordAssociation<'a, Word> {
             similarity: self.similarity,
             a_occurrences: self.a_occurrences,
             b_occurrences: self.b_occurrences,
-            alignable_sentence_table: self.alignable_sentence_table,
+            ast: self.ast,
             a_word_sentence_index: self.a_word_sentence_index,
             b_word_sentence_index: self.b_word_sentence_index,
         }
@@ -46,10 +50,10 @@ where
 }
 
 impl<'a, Word: Eq + Hash + Debug> WordAssociation<'a, Word> {
-    pub fn new(
-        alignable_sentence_table: &'a Vec<Vec<usize>>,
-        a_word_sentence_index: &'a HashMap<&Word, Vec<usize>>,
-        b_word_sentence_index: &'a HashMap<&Word, Vec<usize>>,
+    pub(crate) fn new(
+        ast: &'a AlignableSentenceTable,
+        a_word_sentence_index: &'a WordSentenceIndex<'a, Word, Y>,
+        b_word_sentence_index: &'a WordSentenceIndex<'a, Word, X>,
         a: &'a Word,
         b: &'a Word,
         association_mapper: impl for<'b> Fn(&'b Word, &'b Word) -> bool,
@@ -61,39 +65,30 @@ impl<'a, Word: Eq + Hash + Debug> WordAssociation<'a, Word> {
             similarity: if mapped_association {
                 1.0
             } else {
-                Self::similarity(
-                    alignable_sentence_table,
-                    a_word_sentence_index,
-                    b_word_sentence_index,
-                    a,
-                    b,
-                )
+                Self::similarity(ast, a_word_sentence_index, b_word_sentence_index, a, b)
             },
             a_occurrences: if mapped_association {
                 usize::MAX
             } else {
-                a_word_sentence_index[&a].len()
+                a_word_sentence_index.occurrences(a)
             },
             b_occurrences: if mapped_association {
                 usize::MAX
             } else {
-                b_word_sentence_index[&b].len()
+                b_word_sentence_index.occurrences(b)
             },
-            alignable_sentence_table,
+            ast,
             a_word_sentence_index,
             b_word_sentence_index,
         }
     }
 
-    pub fn align_sentences(
-        &self,
-        sentence_alignment_table: &mut Vec<Vec<usize>>,
-    ) -> Vec<[usize; 2]> {
+    pub(crate) fn align_sentences(&self, sat: &mut SentenceAlignmentTable) -> Vec<Coordinates> {
         let mut a_candidates = HashMap::new();
         let mut b_candidates = HashMap::new();
-        for &y in &self.a_word_sentence_index[self.a] {
-            for &x in &self.b_word_sentence_index[self.b] {
-                if self.alignable_sentence_table[y][x] == 1 {
+        for y in self.a_word_sentence_index.sentences(self.a) {
+            for x in self.b_word_sentence_index.sentences(self.b) {
+                if self.ast.contains(Coordinates(x, y)) {
                     a_candidates.entry(y).or_insert_with(HashSet::new).insert(x);
                     b_candidates.entry(x).or_insert_with(HashSet::new).insert(y);
                 }
@@ -111,58 +106,36 @@ impl<'a, Word: Eq + Hash + Debug> WordAssociation<'a, Word> {
                         .unwrap()
                         == x
             })
-            .map(|(x, ys)| [x, *ys.iter().next().unwrap()])
+            .map(|(x, ys)| Coordinates(x, *ys.iter().next().unwrap()))
             .collect::<Vec<_>>();
 
-        for [x, y] in &matches {
-            if sentence_alignment_table[*y][*x] == 0 {
-                for y in (y + 1)..sentence_alignment_table.len() {
-                    for x in 0..*x {
-                        if sentence_alignment_table[y][x] >= 1 {
-                            return vec![];
-                        }
-                    }
-                }
-
-                for y in 0..*y {
-                    for x in (x + 1)..sentence_alignment_table[0].len() {
-                        if sentence_alignment_table[y][x] >= 1 {
-                            return vec![];
-                        }
-                    }
-                }
+        for &coordinate in &matches {
+            if sat.score(coordinate) == Score::ZERO && sat.crossover(coordinate) {
+                return vec![];
             }
         }
 
-        for [x, y] in &matches {
-            sentence_alignment_table[*y][*x] += 1;
+        for &coordinates in &matches {
+            sat.increment(coordinates);
         }
 
         matches
     }
 
     fn similarity(
-        alignable_sentence_table: &Vec<Vec<usize>>,
-        a_word_sentence_index: &HashMap<&Word, Vec<usize>>,
-        b_word_sentence_index: &HashMap<&Word, Vec<usize>>,
+        ast: &AlignableSentenceTable,
+        a_word_sentence_index: &WordSentenceIndex<'a, Word, Y>,
+        b_word_sentence_index: &WordSentenceIndex<'a, Word, X>,
         a: &Word,
         b: &Word,
     ) -> f32 {
-        let a_candidates = a_word_sentence_index[&a]
-            .iter()
-            .map(|&sentence| Candidate {
-                sentence,
-                alignable_sentence_table,
-                y_axis: true,
-            })
+        let a_candidates = a_word_sentence_index
+            .sentences(a)
+            .map(|sentence| Candidate { sentence, ast })
             .collect::<Vec<_>>();
-        let b_candidates = b_word_sentence_index[&b]
-            .iter()
-            .map(|&sentence| Candidate {
-                sentence,
-                alignable_sentence_table,
-                y_axis: false,
-            })
+        let b_candidates = b_word_sentence_index
+            .sentences(b)
+            .map(|sentence| Candidate { sentence, ast })
             .collect::<Vec<_>>();
 
         let output = hirschberg::Config {
@@ -173,8 +146,8 @@ impl<'a, Word: Eq + Hash + Debug> WordAssociation<'a, Word> {
         .compute(&a_candidates, &b_candidates);
 
         let c = output.score();
-        let a_occurrences = a_word_sentence_index[&a].len();
-        let b_occurrences = b_word_sentence_index[&b].len();
+        let a_occurrences = a_word_sentence_index.occurrences(a);
+        let b_occurrences = b_word_sentence_index.occurrences(b);
 
         (2 * c) as f32 / (a_occurrences + b_occurrences) as f32
     }
@@ -212,18 +185,21 @@ impl<'a, Word: PartialEq + PartialOrd> Ord for WordAssociation<'a, Word> {
     }
 }
 
-struct Candidate<'a> {
-    sentence: usize,
-    alignable_sentence_table: &'a Vec<Vec<usize>>,
-    y_axis: bool,
+struct Candidate<'a, Sentence> {
+    sentence: Sentence,
+    ast: &'a AlignableSentenceTable,
 }
 
-impl<'a> PartialEq for Candidate<'a> {
-    fn eq(&self, other: &Self) -> bool {
-        if self.y_axis {
-            self.alignable_sentence_table[self.sentence][other.sentence] != 0
-        } else {
-            self.alignable_sentence_table[other.sentence][self.sentence] != 0
-        }
+impl<'a> PartialEq<Candidate<'a, X>> for Candidate<'a, Y> {
+    fn eq(&self, other: &Candidate<'a, X>) -> bool {
+        self.ast
+            .contains(Coordinates(other.sentence, self.sentence))
+    }
+}
+
+impl<'a> PartialEq<Candidate<'a, Y>> for Candidate<'a, X> {
+    fn eq(&self, other: &Candidate<'a, Y>) -> bool {
+        self.ast
+            .contains(Coordinates(self.sentence, other.sentence))
     }
 }

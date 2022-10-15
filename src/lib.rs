@@ -2,37 +2,68 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
+mod alignable_sentence_table;
+mod sentence_alignment_table;
 mod word_association;
+mod word_association_table;
+mod word_sentence_index;
 
+use alignable_sentence_table::AlignableSentenceTable;
+use sentence_alignment_table::{Score, SentenceAlignmentTable};
 use word_association::WordAssociation;
+use word_association_table::WordAssociationTable;
+use word_sentence_index::WordSentenceIndex;
 
 pub trait Sentence<Word: PartialEq> {
     fn words(&self) -> &[Word];
 }
 
-pub struct Output<'a, T> {
-    anchor_threshold: usize,
+pub struct Output<'a, T, U> {
     a: &'a [T],
-    b: &'a [T],
-    sentence_alignment_table: Vec<Vec<usize>>,
+    b: &'a [U],
+    a_alignments: HashMap<Y, BTreeSet<X>>,
+    b_alignments: HashMap<X, BTreeSet<Y>>,
     coverage: Vec<f32>,
 }
 
-impl<'a, T> Output<'a, T> {
+impl<'a, T, U> Output<'a, T, U> {
+    fn new(a: &'a [T], b: &'a [U], sat: SentenceAlignmentTable, coverage: Vec<f32>) -> Self {
+        let mut a_alignments: HashMap<Y, BTreeSet<X>> = Default::default();
+        let mut b_alignments: HashMap<X, BTreeSet<Y>> = Default::default();
+
+        for Coordinates(x, y) in sat.anchors() {
+            a_alignments.entry(y).or_default().insert(x);
+            b_alignments.entry(x).or_default().insert(y);
+        }
+
+        Self {
+            a,
+            b,
+            a_alignments,
+            b_alignments,
+            coverage,
+        }
+    }
+
     /// Returns an iterator of alignments for the sentence at index `i` of text `a`
-    pub fn a_alignments(&self, i: usize) -> impl Iterator<Item = &T> {
-        self.sentence_alignment_table[i]
-            .iter()
-            .enumerate()
-            .filter_map(|(j, &n)| (n >= self.anchor_threshold).then_some(&self.b[j]))
+    pub fn a_alignments(&self, i: usize) -> impl Iterator<Item = &U> {
+        self.a_alignments
+            .get(&Y(i))
+            .into_iter()
+            .flatten()
+            .map(|X(j)| &self.b[*j])
+        // .iter()
+        // .enumerate()
+        // .filter_map(|(j, &n)| (n >= self.anchor_threshold).then_some(&self.b[j]))
     }
 
     /// Returns an iterator of alignments for the sentence at index `i` of text `b`
     pub fn b_alignments(&self, i: usize) -> impl Iterator<Item = &T> {
-        self.sentence_alignment_table
-            .iter()
-            .enumerate()
-            .filter_map(move |(j, row)| (row[i] >= self.anchor_threshold).then_some(&self.a[j]))
+        self.b_alignments
+            .get(&X(i))
+            .into_iter()
+            .flatten()
+            .map(|Y(j)| &self.a[*j])
     }
 
     /// Returns the coverage (aligned sentences / total sentences) obtained per cycle
@@ -90,13 +121,14 @@ impl<Word> Default for Config<Word> {
 }
 
 impl<Word> Config<Word> {
-    pub fn align<'a, T>(self, a: &'a [T], b: &'a [T]) -> Output<'a, T>
+    pub fn align<'a, T, U>(self, a: &'a [T], b: &'a [U]) -> Output<'a, T, U>
     where
         Word: Eq + PartialOrd + Hash + std::fmt::Debug + 'a,
         T: Sentence<Word>,
+        U: Sentence<Word>
     {
         Parallelogram {
-            anchor_threshold: self.anchor_threshold,
+            anchor_threshold: Score::from(self.anchor_threshold),
             max_cycles: self.max_cycles,
             word_frequency_threshold: self.word_frequency_threshold,
             word_frequency_minimum: self.word_frequency_minimum,
@@ -105,8 +137,12 @@ impl<Word> Config<Word> {
             word_similarity_taper: self.word_similarity_taper,
             word_similarity_minimum: self.word_similarity_minimum,
             min_coverage: self.min_coverage,
-            a_word_sentence_index: Parallelogram::word_sentence_index(a),
-            b_word_sentence_index: Parallelogram::word_sentence_index(b),
+            a_word_sentence_index: WordSentenceIndex::new(
+                a.iter().map(|sentence| sentence.words()),
+            ),
+            b_word_sentence_index: WordSentenceIndex::new(
+                b.iter().map(|sentence| sentence.words()),
+            ),
             a,
             b,
             association_mapper: self.association_mapper,
@@ -115,8 +151,41 @@ impl<Word> Config<Word> {
     }
 }
 
-struct Parallelogram<'a, Word, T> {
-    anchor_threshold: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct X(usize);
+
+impl From<usize> for X {
+    fn from(y: usize) -> Self {
+        Self(y)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Y(usize);
+
+impl From<usize> for Y {
+    fn from(y: usize) -> Self {
+        Self(y)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Coordinates(X, Y);
+
+impl Coordinates {
+    const ORIGIN: Self = Self(X(0), Y(0));
+
+    fn x(&self) -> X {
+        self.0
+    }
+
+    fn y(&self) -> Y {
+        self.1
+    }
+}
+
+struct Parallelogram<'a, Word, T, U> {
+    anchor_threshold: Score,
     max_cycles: usize,
     word_frequency_threshold: usize,
     word_frequency_taper: usize,
@@ -125,20 +194,21 @@ struct Parallelogram<'a, Word, T> {
     word_similarity_taper: f32,
     word_similarity_minimum: f32,
     min_coverage: f32,
-    a: &'a [T], // Y-axis
-    b: &'a [T],
-    a_word_sentence_index: HashMap<&'a Word, Vec<usize>>,
-    b_word_sentence_index: HashMap<&'a Word, Vec<usize>>,
+    a: &'a [T],
+    b: &'a [U],
+    a_word_sentence_index: WordSentenceIndex<'a, Word, Y>,
+    b_word_sentence_index: WordSentenceIndex<'a, Word, X>,
     association_mapper: AssociationMapper<Word>,
 }
 
-impl<'a, Word, T> Parallelogram<'a, Word, T>
+impl<'a, Word, T, U> Parallelogram<'a, Word, T, U>
 where
     Word: Eq + PartialOrd + Hash + std::fmt::Debug,
     T: Sentence<Word>,
+    U: Sentence<Word>
 {
-    fn align(&self) -> Output<'a, T> {
-        let mut sentence_alignment_table = vec![vec![0; self.b.len()]; self.a.len()];
+    fn align(&self) -> Output<'a, T, U> {
+        let mut sat = SentenceAlignmentTable::new(self.a, self.b, self.anchor_threshold);
         let mut cycle_count = 0;
         let mut a_aligned = HashSet::new();
         let mut b_aligned = HashSet::new();
@@ -146,19 +216,18 @@ where
         let mut coverage_report = vec![];
 
         while coverage < self.min_coverage && cycle_count < self.max_cycles {
-            let alignable_sentence_table =
-                alignable_sentence_table(&sentence_alignment_table, self.anchor_threshold);
+            let ast = AlignableSentenceTable::from(&sat);
 
-            let word_association_table = self.word_association_tables(
-                &alignable_sentence_table,
+            let wat = self.word_association_table(
+                &ast,
                 (self.word_similarity_threshold - cycle_count as f32 * self.word_similarity_taper)
                     .max(self.word_similarity_minimum),
                 (self.word_frequency_threshold - cycle_count * self.word_frequency_taper)
                     .max(self.word_frequency_minimum),
             );
 
-            for Reverse(association) in word_association_table {
-                for [x, y] in association.align_sentences(&mut sentence_alignment_table) {
+            for Reverse(association) in wat {
+                for Coordinates(x, y) in association.align_sentences(&mut sat) {
                     a_aligned.insert(y);
                     b_aligned.insert(x);
                 }
@@ -170,140 +239,43 @@ where
             coverage_report.push(coverage);
         }
 
-        Output {
-            anchor_threshold: self.anchor_threshold,
-            a: self.a,
-            b: self.b,
-            sentence_alignment_table,
-            coverage: coverage_report,
-        }
+        Output::new(self.a, self.b, sat, coverage_report)
     }
 
-    fn word_association_tables(
-        &self,
-        alignable_sentence_table: &'a Vec<Vec<usize>>,
+    fn word_association_table(
+        &'a self,
+        ast: &'a AlignableSentenceTable,
         similarity_threshold: f32,
         frequency_threshold: usize,
-    ) -> BTreeSet<Reverse<WordAssociation<Word>>> {
+    ) -> WordAssociationTable<'a, Word> {
         let mut visited = HashSet::new();
-        let mut word_association_table = BTreeSet::new();
+        let mut wat = BTreeSet::new();
 
-        for y in 0..alignable_sentence_table.len() {
-            for x in 0..alignable_sentence_table[0].len() {
-                if alignable_sentence_table[y][x] == 1 {
-                    for a_word in self.a[y].words() {
-                        for b_word in self.b[x].words() {
-                            if !visited.contains(&(a_word, b_word)) {
-                                visited.insert((a_word, b_word));
-                                let association = WordAssociation::new(
-                                    alignable_sentence_table,
-                                    &self.a_word_sentence_index,
-                                    &self.b_word_sentence_index,
-                                    a_word,
-                                    b_word,
-                                    &self.association_mapper,
-                                );
+        for Coordinates(x, y) in ast.all() {
+            for a_word in self.a[y.0].words() {
+                for b_word in self.b[x.0].words() {
+                    if !visited.contains(&(a_word, b_word)) {
+                        visited.insert((a_word, b_word));
+                        let association = WordAssociation::new(
+                            ast,
+                            &self.a_word_sentence_index,
+                            &self.b_word_sentence_index,
+                            a_word,
+                            b_word,
+                            &self.association_mapper,
+                        );
 
-                                if association.similarity >= similarity_threshold
-                                    && association.a_occurrences >= frequency_threshold
-                                    && association.b_occurrences >= frequency_threshold
-                                {
-                                    word_association_table.insert(Reverse(association));
-                                }
-                            }
+                        if association.similarity >= similarity_threshold
+                            && association.a_occurrences >= frequency_threshold
+                            && association.b_occurrences >= frequency_threshold
+                        {
+                            wat.insert(Reverse(association));
                         }
                     }
                 }
             }
         }
 
-        word_association_table
+        wat
     }
-
-    fn word_sentence_index(sentences: &[T]) -> HashMap<&Word, Vec<usize>> {
-        let mut map = HashMap::new();
-
-        for (i, sentence) in sentences.iter().enumerate() {
-            for word in sentence.words() {
-                map.entry(word).or_insert(Vec::new()).push(i);
-            }
-        }
-
-        map
-    }
-}
-
-fn alignable_sentence_table(
-    sentence_alignment_table: &Vec<Vec<usize>>,
-    anchor_threshold: usize,
-) -> Vec<Vec<usize>> {
-    let next_anchor =
-        |sentence_alignment_table: &Vec<Vec<usize>>, from: Option<[usize; 2]>| -> [usize; 2] {
-            if let Some([from_x, from_y]) = from {
-                sentence_alignment_table
-                    .iter()
-                    .enumerate()
-                    .skip_while(|(y, _)| *y <= from_y)
-                    .find_map(|(y, row)| {
-                        row.iter()
-                            .enumerate()
-                            .skip_while(|(x, _)| y == from_y && *x <= from_x)
-                            .find_map(|(x, score)| (*score >= anchor_threshold).then_some([x, y]))
-                    })
-                    .unwrap_or([
-                        sentence_alignment_table[0].len() - 1,
-                        sentence_alignment_table.len() - 1,
-                    ])
-            } else {
-                [0, 0]
-            }
-        };
-
-    let mut alignable_sentence_table =
-        vec![vec![0; sentence_alignment_table[0].len()]; sentence_alignment_table.len()];
-
-    let [mut start_x, mut start_y] = next_anchor(sentence_alignment_table, None);
-    let [mut end_x, mut end_y] = next_anchor(sentence_alignment_table, Some([start_x, start_y]));
-
-    while [start_x, start_y] != [end_x, end_y] {
-        let x_distance = (end_x - start_x) as f32;
-        let y_distance = (end_y - start_y) as f32;
-
-        if x_distance > y_distance {
-            for y in start_y..=end_y {
-                let progress = (y - start_y) as f32 / y_distance;
-                let scale = (0.5 - progress).abs() / 0.5;
-                let n = (x_distance.sqrt() - scale * x_distance.sqrt())
-                    .min(x_distance.sqrt())
-                    .max(1.0) as usize;
-
-                let diagonal = start_x as f32 + (progress * x_distance);
-                let min = (diagonal - n as f32 / 2.0).floor().max(start_x as f32) as usize;
-                let max = (diagonal + n as f32 / 2.0).floor().min(end_x as f32) as usize;
-                for x in min..=max {
-                    alignable_sentence_table[y][x] = 1;
-                }
-            }
-        } else {
-            for x in start_x..=end_x {
-                let progress = (x - start_x) as f32 / x_distance;
-                let scale = (0.5 - progress).abs() / 0.5;
-                let n = (y_distance.sqrt() - scale * y_distance.sqrt())
-                    .min(y_distance.sqrt())
-                    .max(1.0) as usize;
-
-                let diagonal = start_y as f32 + (progress * y_distance);
-                let min = (diagonal - n as f32 / 2.0).floor().max(start_y as f32) as usize;
-                let max = (diagonal + n as f32 / 2.0).floor().min(end_y as f32) as usize;
-                for y in min..=max {
-                    alignable_sentence_table[y][x] = 1;
-                }
-            }
-        }
-
-        [start_x, start_y] = [end_x, end_y];
-        [end_x, end_y] = next_anchor(sentence_alignment_table, Some([start_x, start_y]));
-    }
-
-    alignable_sentence_table
 }

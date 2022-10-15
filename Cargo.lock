@@ -5,7 +5,7 @@ version = 3
 [[package]]
 name = "hirschberg"
 version = "0.1.0"
-source = "git+https://github.com/nicksenger/hirschberg#5e109c43cbd9ba020591ad8e92de1ea323a2e6f9"
+source = "git+https://github.com/nicksenger/hirschberg#d55c154d499c54a192ba8c30ffc57768a0224d9d"
 
 [[package]]
 name = "parallelogram"
